@@ -251,12 +251,12 @@ EOF
 #######################################
 main() {
   if ! check_deps uci nft xray grep; then
-    exit 1
+    return 1
   fi
 
   if [ $# -eq 0 ]; then
     usage
-    exit 1
+    return 1
   fi
 
   local cmd="$1"
@@ -264,16 +264,16 @@ main() {
 
   case "${cmd}" in
     setup)
-      cmd_setup || exit 1
+      cmd_setup || return 1
       ;;
     start)
-      cmd_start || exit 1
+      cmd_start || return 1
       ;;
     stop)
-      cmd_stop || exit 1
+      cmd_stop || return 1
       ;;
     teardown)
-      cmd_teardown || exit 1
+      cmd_teardown || return 1
       ;;
     -v|--version|version)
       show_version
@@ -284,9 +284,11 @@ main() {
     *)
       log error "Unknown command: ${cmd}"
       usage
-      exit 1
+      return 1
       ;;
   esac
 }
 
-main "$@"
+if ! main "$@"; then
+  exit 1
+fi

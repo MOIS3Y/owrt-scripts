@@ -60,7 +60,7 @@ log() {
 # Arguments:
 #   Variable number of command names.
 # Returns:
-#   0 if all exist, exits with 1 and logs missing if any are found.
+#   0 if all exist, 1 otherwise.
 #######################################
 check_deps() {
   local missing=""; local cmd
@@ -71,7 +71,7 @@ check_deps() {
   done
   if [ -n "${missing}" ]; then
     log error "Missing dependencies: ${missing}"
-    exit 1
+    return 1
   fi
 }
 
@@ -324,7 +324,7 @@ add_lease() {
   if [ -z "${name}" ] && [ -z "${mac}" ] && [ -z "${ip}" ]; then
     if [ "${silent}" = "true" ]; then
       log error "Need all args for silent mode."
-      exit 1
+      return 1
     fi
 
     if [ -f /tmp/dhcp.leases ] && [ -s /tmp/dhcp.leases ]; then
@@ -370,12 +370,12 @@ add_lease() {
 
   if ! validate_mac "${mac}"; then
     log error "Bad MAC: ${mac}"
-    exit 1
+    return 1
   fi
 
   if ! validate_ip "${ip}"; then
     log error "Bad IP: ${ip}"
-    exit 1
+    return 1
   fi
 
   if [ "${silent}" = "false" ]; then
@@ -484,7 +484,7 @@ interactive_menu() {
       3) edit_lease ;;
       4) del_lease ;;
       5) apply_changes ;;
-      6) log info "Bye!"; exit 0 ;;
+      6) log info "Bye!"; return 0 ;;
       *) log warn "Unknown choice." ;;
     esac
   done
@@ -546,11 +546,11 @@ EOF
 # Script entry point.
 #######################################
 main() {
-  check_deps uci sed
+  check_deps uci sed || return 1
 
   if [ $# -eq 0 ]; then
     interactive_menu
-    return
+    return 0
   fi
 
   local cmd="$1"
@@ -564,7 +564,7 @@ main() {
       show_version
       ;;
     add)
-      add_lease "$@"
+      add_lease "$@" || return 1
       local is_s="false"
       local a
       for a in "$@"; do
@@ -577,11 +577,11 @@ main() {
       fi
       ;;
     del)
-      del_lease "${1:-}"
+      del_lease "${1:-}" || return 1
       apply_changes
       ;;
     edit)
-      edit_lease "${1:-}"
+      edit_lease "${1:-}" || return 1
       apply_changes
       ;;
     show)
@@ -593,9 +593,11 @@ main() {
     *)
       log error "Unknown command: ${cmd}"
       usage
-      exit 1
+      return 1
       ;;
   esac
 }
 
-main "$@"
+if ! main "$@"; then
+  exit 1
+fi
