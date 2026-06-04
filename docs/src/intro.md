@@ -18,5 +18,6 @@ While the LuCI web interface is great, I find myself working in the terminal mor
 
 - **[DHCP Lease Manager](dhcp-lease.md)**: Interactive and CLI tool for static IP assignments.
 - **[Xray TProxy Manager](xray-tproxy.md)**: A helper to manage transparent proxying for Xray with nftables.
+- **[Zsh Installer](zsh-install.md)**: Automate Zsh + Oh My Zsh installation without Git.
 
 Feel free to browse, use, or adapt these scripts for your own needs! ❤️
