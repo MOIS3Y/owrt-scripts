@@ -28,6 +28,7 @@ I've decided to share them in case someone finds them useful for their own setup
 - **`dhcp-lease.sh`**: Easily manage static DHCP leases via CLI or an interactive menu.
 - **`xray-tproxy.sh`**: Manage Xray transparent proxy (NAT REDIRECT) using modern `nftables` (fw4).
 - **`zsh-install.sh`**: Install/uninstall Zsh + Oh My Zsh with plugins without Git.
+- **`vim-config.sh`**: Install full Vim and apply a modern `.vimrc` configuration.
 - **UCI-native**: All scripts interact with OpenWrt's configuration system properly.
 - **Lightweight**: Written in `ash`, no heavy dependencies required on the router.
 
