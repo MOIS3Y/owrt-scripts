@@ -1,4 +1,5 @@
 #!/usr/bin/env ash
+# shellcheck shell=dash
 #
 # DHCP Static Lease Management for OpenWrt.
 # Subcommands: add, del, show, edit, apply.
@@ -493,15 +494,19 @@ interactive_menu() {
 # Displays script version.
 #######################################
 show_version() {
-  printf "dhcp-lease.sh version %s\n" "$(colorize green "${SCRIPT_VERSION}")"
+  local name="${0##*/}"
+  name="${name%.sh}"
+  printf "%s version %s\n" "${name}" "$(colorize green "${SCRIPT_VERSION}")"
 }
 
 #######################################
 # Displays detailed usage information.
 #######################################
 usage() {
+  local name="${0##*/}"
+  name="${name%.sh}"
   cat << EOF
-Usage: $(colorize yellow "$(basename "$0")") $(colorize green "COMMAND") [OPTIONS]
+Usage: $(colorize yellow "${name}") $(colorize green "COMMAND") [OPTIONS]
 
 OpenWrt DHCP Static Lease Manager. Starts interactive menu if no command.
 

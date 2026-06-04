@@ -1,4 +1,5 @@
 #!/usr/bin/env ash
+# shellcheck shell=dash
 #
 # Xray Transparent Proxy Management for OpenWrt (NAT REDIRECT method).
 # Tested on: OpenWrt 25.12.4 r32933-4ccb782af7
@@ -210,11 +211,22 @@ cmd_stop() {
 }
 
 #######################################
+# Displays script version.
+#######################################
+show_version() {
+  local name="${0##*/}"
+  name="${name%.sh}"
+  printf "%s version %s\n" "${name}" "$(colorize green "${SCRIPT_VERSION}")"
+}
+
+#######################################
 # Displays detailed usage information.
 #######################################
 usage() {
+  local name="${0##*/}"
+  name="${name%.sh}"
   cat << EOF
-Usage: $(colorize yellow "$(basename "$0")") $(colorize green "COMMAND")
+Usage: $(colorize yellow "${name}") $(colorize green "COMMAND")
 
 OpenWrt Xray REDIRECT Manager.
 Tested on: OpenWrt 25.12.4
@@ -224,6 +236,10 @@ $(colorize blue "Commands:")
   $(colorize green "start")     Starts Xray and applies firewall routing.
   $(colorize green "stop")      Stops Xray and flushes active rules.
   $(colorize green "teardown")  Removes configurations and files.
+
+$(colorize blue "Global Options:")
+  -h, --help     Show this help message.
+  -v, --version  Show the script version.
 
 $(colorize blue "Environment:")
   XRAY_REDIRECT_PORT  Overrides the default port (10807).
@@ -258,6 +274,9 @@ main() {
       ;;
     teardown)
       cmd_teardown || exit 1
+      ;;
+    -v|--version|version)
+      show_version
       ;;
     -h|--help|help)
       usage
