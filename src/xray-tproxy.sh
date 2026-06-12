@@ -10,7 +10,7 @@
 
 set -eu
 
-readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_VERSION="0.3.1"
 readonly XRAY_CONF_FILE="/etc/xray/config.json"
 readonly NFT_RULE_FILE="/etc/xray/xray-tproxy.nft"
 readonly INIT_SCRIPT="/etc/init.d/xray-tproxy"
@@ -209,6 +209,12 @@ generate_nft_rules() {
   cat <<EOF > "${NFT_RULE_FILE}"
 table inet fw4 {
   chain xray_tproxy {
+    # Bypass reply traffic for connections initiated from the outside
+    ct direction reply return
+
+    # Bypass traffic destined to the router's own IPs fixes Hairpin NAT/loopback
+    fib daddr type local return
+
     # Only process LAN traffic
     ip saddr != ${LAN_SUBNET} return
 
