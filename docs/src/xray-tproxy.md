@@ -25,6 +25,7 @@ The following diagram illustrates how traffic flows through the router when `xra
 │             │   └─► jump xray_tproxy (index 0)  │                      │
 │             │                                   │                      │
 │             │ chain xray_tproxy:                │                      │
+│             │  - bypass: reply / local IPs      │                      │
 │             │  - bypass: LAN/Private subnets    │                      │
 │             │  - TPROXY: TCP/UDP to port 10807  │                      │
 │             │            meta mark set 1        │                      │
