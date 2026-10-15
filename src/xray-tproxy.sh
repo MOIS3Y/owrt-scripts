@@ -10,7 +10,7 @@
 
 set -eu
 
-readonly SCRIPT_VERSION="0.3.1"
+readonly SCRIPT_VERSION="0.3.2"
 readonly XRAY_CONF_FILE="/etc/xray/config.json"
 readonly NFT_RULE_FILE="/etc/xray/xray-tproxy.nft"
 readonly INIT_SCRIPT="/etc/init.d/xray-tproxy"
@@ -220,6 +220,12 @@ table inet fw4 {
 
     # Bypass local network destinations
     ip daddr { ${l_nets}, ${o_nets} } return
+
+    # Leave DNS enforcement to downstream firewall rules. TPROXY runs before
+    # dstnat, so intercepting these ports conflicts with services such as
+    # https-dns-proxy force_dns. Port 53 can then be redirected to dnsmasq,
+    # while port 853 can be rejected by the regular forwarding rules.
+    meta l4proto { tcp, udp } th dport { 53, 853 } return
 
     # Apply TPROXY for TCP and UDP
     meta l4proto { tcp, udp } tproxy to :${TPROXY_PORT} \\

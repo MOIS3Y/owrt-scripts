@@ -2,7 +2,7 @@
 
 *Tested on OpenWrt 25.12.4*
 
-`xray-tproxy.sh` is a management utility for Xray transparent proxying. It uses the **TPROXY** method, which is robust, supports both TCP and UDP natively (preventing DNS/QUIC leaks), and is easy to configure on modern OpenWrt versions using `fw4` (nftables).
+`xray-tproxy.sh` is a management utility for Xray transparent proxying. It uses the **TPROXY** method, which is robust, supports both TCP and UDP natively, and is easy to configure on modern OpenWrt versions using `fw4` (nftables). DNS and DoT ports are deliberately left to the regular firewall path so they can be handled consistently by a local encrypted-DNS service.
 
 Unlike simple bash scripts, this utility acts as an **installer and lifecycle manager**. It generates a native OpenWrt `init.d` daemon and a `hotplug` hook, ensuring that your transparent proxy automatically survives router reboots, PPPoE reconnections, and `fw4` firewall reloads.
 
@@ -27,6 +27,7 @@ The following diagram illustrates how traffic flows through the router when `xra
 │             │ chain xray_tproxy:                │                      │
 │             │  - bypass: reply / local IPs      │                      │
 │             │  - bypass: LAN/Private subnets    │                      │
+│             │  - bypass: DNS/DoT ports 53/853   │                      │
 │             │  - TPROXY: TCP/UDP to port 10807  │                      │
 │             │            meta mark set 1        │                      │
 │             └───────────────────────────────────┘                      │
@@ -66,6 +67,26 @@ The following diagram illustrates how traffic flows through the router when `xra
 
 > [!NOTE]
 > This script handles the **firewall routing** part. It catches TCP and UDP traffic using policy routing and firewall marks, and sends it to Xray. You must still configure Xray's routing rules (`routing` object in `config.json`) to define what actually gets proxied and what goes direct.
+
+### DNS and encrypted-DNS integration
+
+The TPROXY chain deliberately returns TCP and UDP traffic for destination
+ports `53` and `853` before the final TPROXY rule. This avoids a conflict with
+OpenWrt services such as `https-dns-proxy`, whose `force_dns` rules run later
+in the nftables hook order.
+
+With `https-dns-proxy` and `force_dns` enabled, the resulting flow is:
+
+```text
+LAN DNS/53 -> bypass Xray TPROXY -> force_dns redirect -> dnsmasq
+           -> local https-dns-proxy -> upstream DoH
+
+LAN DoT/853 -> bypass Xray TPROXY -> force_dns reject
+```
+
+This bypass only affects transparent interception of client packets addressed
+to ports `53` and `853`. Xray's built-in DNS, domain-based routing, sniffing,
+and SOCKS/HTTP inbounds continue to work normally.
 
 ## Prerequisites
 
