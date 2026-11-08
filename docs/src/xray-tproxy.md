@@ -1,10 +1,12 @@
 # Xray TProxy Manager
 
-*Tested on OpenWrt 25.12.4*
+*Tested on OpenWrt 25.12.6*
 
 `xray-tproxy.sh` is a management utility for Xray transparent proxying. It uses the **TPROXY** method, which is robust, supports both TCP and UDP natively, and is easy to configure on modern OpenWrt versions using `fw4` (nftables). DNS and DoT ports are deliberately left to the regular firewall path so they can be handled consistently by a local encrypted-DNS service.
 
-Unlike simple bash scripts, this utility acts as an **installer and lifecycle manager**. It generates a native OpenWrt `init.d` daemon and a `hotplug` hook, ensuring that your transparent proxy automatically survives router reboots, PPPoE reconnections, and `fw4` firewall reloads.
+Unlike simple shell scripts, this utility acts as an **installer and lifecycle manager**. It generates a native OpenWrt `init.d` service and a `hotplug` hook, ensuring that transparent interception is reconstructed after router reboots, PPPoE reconnections, and `fw4` firewall reloads.
+
+The native Xray daemon is a shared dependency. Stopping or removing TPROXY leaves Xray running, so its SOCKS, HTTP, TUN, and other inbounds remain available.
 
 > [!IMPORTANT]
 > This script is specifically designed for OpenWrt versions using `fw4` (nftables). If you are on an older version with `iptables` (fw3), it will not work without significant modifications.
@@ -15,7 +17,7 @@ The following diagram illustrates how traffic flows through the router when `xra
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        OpenWrt 25.12.4 Router                          │
+│                        OpenWrt 25.12.6 Router                          │
 │                                                                        │
 │  LAN Client ───────► br-lan (192.168.1.1)                              │
 │                               │                                        │
@@ -101,6 +103,11 @@ apk add xray-core kmod-nf-tproxy kmod-nft-tproxy kmod-nft-core kmod-nft-nat kmod
 
 You also need a basic configuration in `/etc/xray/config.json` that includes a `dokodemo-door` inbound with `followRedirect: true` and tproxy stream settings.
 
+The standard `/etc/init.d/xray` service must be configured. During `setup`, the
+TPROXY manager ensures that its required `xray.enabled.enabled='1'` UCI flag is
+present. It preserves the existing config path, format, and other native Xray
+settings.
+
 **Example Xray inbound:**
 ```json
 "inbounds": [
@@ -152,24 +159,55 @@ This script manages its own lifecycle. The commands are strictly idempotent, mea
 #    (Must be run once after downloading).
 xray-tproxy setup
 
-# 2. Start Xray service and activate TPROXY routing.
+# 2. Start Xray when necessary and activate TPROXY routing.
 #    (The init script will automatically do this on boot).
 xray-tproxy start
 
-# 3. Check the current status of Xray, iptables, and nftables.
+# 3. Check the current status of Xray, policy routing, and nftables.
 xray-tproxy status
 
-# 4. Stop Xray and remove routing rules (restores direct internet).
+# 4. Remove TPROXY routing. The shared Xray process keeps running.
 xray-tproxy stop
+
+# Control whether TPROXY is reconstructed after reboot.
+xray-tproxy enable
+xray-tproxy disable
 
 # 5. Completely remove all generated configs, init scripts, and hooks.
 xray-tproxy teardown
 ```
 
+`teardown` preserves the native Xray service, `/etc/xray/config.json`, and the
+script settings file.
+
 ### Automatic Recovery
 
 You do not need to manually run `start` after network interruptions.
-The generated hook (`/etc/hotplug.d/iface/99-xray-tproxy`) listens for `ifup` events. If your PPPoE reconnects or the firewall reloads, the script will automatically pause for a few seconds to let `fw4` settle, and then seamlessly re-inject the `xray_tproxy` chain and routing rules.
+The generated hook (`/etc/hotplug.d/iface/99-xray-tproxy`) listens for `ifup` events. If PPPoE reconnects or the firewall reloads, the script pauses briefly for `fw4` and then re-injects the `xray_tproxy` chain and routing rules. A runtime marker prevents hotplug from reactivating TPROXY after an explicit `stop`.
+
+### Settings
+
+`setup` creates `/etc/config/xray-tproxy` without overwriting an existing file:
+
+```uci
+config main 'main'
+        option xray_config '/etc/xray/config.json'
+        option inbound_tag 'transparent-tproxy'
+        option port '10807'
+        option mark '1'
+        option route_table '100'
+        option lan_subnet '192.168.1.0/24'
+```
+
+Use an alternative UCI settings file with `-c`:
+
+```bash
+xray-tproxy -c /etc/config/xray-tproxy-home setup
+xray-tproxy -c /etc/config/xray-tproxy-home start
+```
+
+The selected path is embedded in the generated init and hotplug integration,
+so the same settings are used after reboot.
 
 ### Environment Variables
 

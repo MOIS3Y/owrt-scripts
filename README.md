@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/Nix-Enabled-blueviolet?style=for-the-badge&logo=nixos&logoColor=white&labelColor=101418" alt="Nix">
   </a>
   <a href="https://openwrt.org">
-    <img src="https://img.shields.io/badge/OpenWrt-25.12.4-success?style=for-the-badge&logo=openwrt&logoColor=white&labelColor=101418" alt="OpenWrt">
+    <img src="https://img.shields.io/badge/OpenWrt-25.12.6-success?style=for-the-badge&logo=openwrt&logoColor=white&labelColor=101418" alt="OpenWrt">
   </a>
   <a href="https://mois3y.github.io/owrt-scripts/">
     <img src="https://img.shields.io/badge/Docs-Latest-blue?style=for-the-badge&labelColor=101418" alt="Docs">
@@ -17,7 +17,7 @@
 
 My personal collection of scripts for OpenWrt management.
 
-This repository contains a set of utility scripts I use on my **ASUS TUF-AX4200** (running **OpenWrt 25.12.4**). These tools help me automate routine tasks like managing DHCP leases and configuring transparent proxying with Xray.
+This repository contains a set of utility scripts I use on my **ASUS TUF-AX4200** (running **OpenWrt 25.12.6**). These tools help me automate routine tasks like managing DHCP leases and configuring transparent proxying with Xray.
 
 I've decided to share them in case someone finds them useful for their own setup.
 
@@ -27,6 +27,7 @@ I've decided to share them in case someone finds them useful for their own setup
 
 - **`dhcp-lease.sh`**: Easily manage static DHCP leases via CLI or an interactive menu.
 - **`xray-tproxy.sh`**: Manage Xray transparent proxy (TPROXY method, TCP+UDP) using modern `nftables` (fw4).
+- **`xray-tun.sh`**: Route LAN clients into an Xray TUN inbound using isolated policy routing.
 - **`zsh-install.sh`**: Install/uninstall Zsh + Oh My Zsh with plugins without Git.
 - **`vim-config.sh`**: Install full Vim and apply a modern `.vimrc` configuration.
 - **UCI-native**: All scripts interact with OpenWrt's configuration system properly.

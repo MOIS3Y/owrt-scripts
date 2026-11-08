@@ -1,37 +1,37 @@
 #!/usr/bin/env ash
 # shellcheck shell=dash
 #
-# Xray Transparent Proxy Management for OpenWrt (TPROXY method).
-# Tested on: OpenWrt 25.12.4
-#
-# This script configures routing, firewall rules, and the native xray daemon
-# to establish a transparent proxy. It manages its own lifecycle integration
-# (init scripts and hotplug hooks) via 'setup' and 'teardown' commands.
+# Xray transparent proxy manager for OpenWrt (TPROXY method).
+# The script owns only TPROXY routing/firewall state. The native Xray service
+# and its configuration are shared with other ingress methods.
 
 set -eu
 
-readonly SCRIPT_VERSION="0.3.2"
-readonly XRAY_CONF_FILE="/etc/xray/config.json"
+readonly SCRIPT_VERSION="0.4.0"
+readonly DEFAULT_SETTINGS_FILE="/etc/config/xray-tproxy"
 readonly NFT_RULE_FILE="/etc/xray/xray-tproxy.nft"
 readonly INIT_SCRIPT="/etc/init.d/xray-tproxy"
 readonly HOTPLUG_HOOK="/etc/hotplug.d/iface/99-xray-tproxy"
+readonly ACTIVE_FILE="/var/run/xray-tproxy.active"
 
-readonly TPROXY_PORT="${XRAY_TPROXY_PORT:-10807}"
-readonly TPROXY_MARK="1"
-readonly ROUTE_TABLE="100"
-readonly LAN_SUBNET="192.168.1.0/24"
+SETTINGS_FILE="${DEFAULT_SETTINGS_FILE}"
+SETTINGS_DIR=""
+SETTINGS_PACKAGE=""
+
+XRAY_CONFIG="/etc/xray/config.json"
+INBOUND_TAG="transparent-tproxy"
+TPROXY_PORT="10807"
+TPROXY_MARK="1"
+ROUTE_TABLE="100"
+LAN_SUBNET="192.168.1.0/24"
 
 #######################################
-# Wraps text in ANSI color codes for terminal output.
-# Globals:
-#   None
+# Wrap text in an ANSI color sequence.
 # Arguments:
-#   1: Color name (e.g., red, green)
-#   2: Text string to format
+#   $1: Color name.
+#   $2: Text to format.
 # Outputs:
-#   Writes colorized string to stdout.
-# Returns:
-#   0
+#   Formatted text without a trailing newline.
 #######################################
 colorize() {
   local color="$1"
@@ -39,134 +39,326 @@ colorize() {
   local code
 
   case "${color}" in
-    red)    code='\033[0;31m' ;;
-    green)  code='\033[0;32m' ;;
+    red) code='\033[0;31m' ;;
+    green) code='\033[0;32m' ;;
     yellow) code='\033[0;33m' ;;
-    blue)   code='\033[0;34m' ;;
-    *)      code='\033[0m'    ;;
+    blue) code='\033[0;34m' ;;
+    *) code='\033[0m' ;;
   esac
   printf "%b%s\033[0m" "${code}" "${text}"
 }
 
 #######################################
-# Unified logging function.
-# Globals:
-#   None
+# Write a consistently formatted log message.
 # Arguments:
-#   1: Log level (info, success, warn, error)
-#   2: Message string
+#   $1: Log level: info, success, warn, or error.
+#   $2: Message text.
 # Outputs:
-#   Writes formatted log messages to stdout or stderr.
-# Returns:
-#   0
+#   Message to stdout, or stderr for errors.
 #######################################
 log() {
   local level="$1"
-  local msg="$2"
+  local message="$2"
 
   case "${level}" in
-    info)    printf "%s %s\n" "$(colorize blue "INFO:")" "${msg}" ;;
-    success) printf "%s %s\n" "$(colorize green "SUCCESS:")" "${msg}" ;;
-    warn)    printf "%s %s\n" "$(colorize yellow "WARN:")" "${msg}" ;;
-    error)   printf "%s %s\n" "$(colorize red "ERROR:")" "${msg}" >&2 ;;
-    *)       printf "%s\n" "${msg}" ;;
+    info) printf "%s %s\n" "$(colorize blue "INFO:")" "${message}" ;;
+    success) printf "%s %s\n" "$(colorize green "SUCCESS:")" "${message}" ;;
+    warn) printf "%s %s\n" "$(colorize yellow "WARN:")" "${message}" ;;
+    error) printf "%s %s\n" "$(colorize red "ERROR:")" "${message}" >&2 ;;
+    *) printf "%s\n" "${message}" ;;
   esac
 }
 
 #######################################
-# Validates existence of required system utilities and kernel modules.
+# Validate and split the selected UCI settings path.
 # Globals:
-#   None
-# Arguments:
-#   $@: List of command names to verify
-# Outputs:
-#   Writes error messages for missing tools to stderr.
+#   SETTINGS_FILE SETTINGS_DIR SETTINGS_PACKAGE
 # Returns:
-#   0 if all tools are found, 1 otherwise.
+#   0 for a safe absolute path, 1 otherwise.
 #######################################
-check_deps() {
+validate_settings_path() {
+  case "${SETTINGS_FILE}" in
+    /*) ;;
+    *)
+      log error "Settings path must be absolute: ${SETTINGS_FILE}"
+      return 1
+      ;;
+  esac
+
+  case "${SETTINGS_FILE}" in
+    *[!A-Za-z0-9_./-]*)
+      log error "Settings path contains unsupported characters: ${SETTINGS_FILE}"
+      return 1
+      ;;
+  esac
+
+  SETTINGS_DIR="${SETTINGS_FILE%/*}"
+  SETTINGS_PACKAGE="${SETTINGS_FILE##*/}"
+  [ -n "${SETTINGS_DIR}" ] || SETTINGS_DIR="/"
+}
+
+#######################################
+# Read an option from the selected UCI main section.
+# Arguments:
+#   $1: UCI option name.
+# Outputs:
+#   Option value when it exists.
+#######################################
+uci_get() {
+  uci -c "${SETTINGS_DIR}" -q get "${SETTINGS_PACKAGE}.main.$1" 2>/dev/null || true
+}
+
+#######################################
+# Load runtime settings from UCI and environment overrides.
+# Globals:
+#   XRAY_CONFIG INBOUND_TAG TPROXY_PORT TPROXY_MARK ROUTE_TABLE LAN_SUBNET
+# Returns:
+#   0 when all loaded values are valid, 1 otherwise.
+#######################################
+load_settings() {
+  local value
+
+  validate_settings_path || return 1
+
+  value="$(uci_get xray_config)"
+  [ -z "${value}" ] || XRAY_CONFIG="${value}"
+  value="$(uci_get inbound_tag)"
+  [ -z "${value}" ] || INBOUND_TAG="${value}"
+  value="$(uci_get port)"
+  [ -z "${value}" ] || TPROXY_PORT="${value}"
+  value="$(uci_get mark)"
+  [ -z "${value}" ] || TPROXY_MARK="${value}"
+  value="$(uci_get route_table)"
+  [ -z "${value}" ] || ROUTE_TABLE="${value}"
+  value="$(uci_get lan_subnet)"
+  [ -z "${value}" ] || LAN_SUBNET="${value}"
+
+  TPROXY_PORT="${XRAY_TPROXY_PORT:-${TPROXY_PORT}}"
+  validate_settings
+}
+
+#######################################
+# Validate an unsigned decimal setting.
+# Arguments:
+#   $1: Human-readable setting name.
+#   $2: Value to validate.
+#######################################
+validate_number() {
+  local name="$1"
+  local value="$2"
+
+  case "${value}" in
+    '' | *[!0-9]*)
+      log error "${name} must be numeric: ${value}"
+      return 1
+      ;;
+  esac
+}
+
+#######################################
+# Validate settings interpolated into routing and nftables commands.
+# Returns:
+#   0 when settings are safe and well-formed, 1 otherwise.
+#######################################
+validate_settings() {
+  validate_number "port" "${TPROXY_PORT}" || return 1
+  validate_number "mark" "${TPROXY_MARK}" || return 1
+  validate_number "route_table" "${ROUTE_TABLE}" || return 1
+
+  if [ "${TPROXY_PORT}" -lt 1 ] || [ "${TPROXY_PORT}" -gt 65535 ]; then
+    log error "port must be between 1 and 65535"
+    return 1
+  fi
+
+  case "${LAN_SUBNET}" in
+    '' | *[!0-9./]*)
+      log error "lan_subnet is not a safe IPv4 CIDR: ${LAN_SUBNET}"
+      return 1
+      ;;
+  esac
+}
+
+#######################################
+# Verify that required executables are available.
+# Arguments:
+#   $@: Command names.
+# Returns:
+#   0 when every command exists, 1 otherwise.
+#######################################
+check_commands() {
   local missing=""
-  local cmd
-  for cmd in "$@"; do
-    if ! command -v "${cmd}" > /dev/null 2>&1; then
-      missing="${missing}${cmd} "
+  local command
+
+  for command in "$@"; do
+    if ! command -v "${command}" >/dev/null 2>&1; then
+      missing="${missing}${command} "
     fi
   done
+
   if [ -n "${missing}" ]; then
     log error "Missing dependencies: ${missing}"
     return 1
   fi
-
-  # Check for kernel tproxy support
-  if ! lsmod | grep -q "tproxy"; then
-    # Try to load it if installed but not loaded
-    if ! modprobe nft_tproxy 2>/dev/null; then
-      log error "Missing TPROXY kernel modules. Install them:"
-      log error "apk add kmod-nft-tproxy kmod-nf-tproxy"
-      return 1
-    fi
-  fi
-
-  return 0
 }
 
 #######################################
-# Writes the OpenWrt init script wrapper to disk.
-# Globals:
-#   INIT_SCRIPT
-# Arguments:
-#   None
-# Outputs:
-#   Creates the init script and makes it executable.
+# Ensure nftables TPROXY kernel support is loaded.
 # Returns:
-#   0 on success.
+#   0 when available, 1 with installation guidance otherwise.
+#######################################
+check_tproxy_support() {
+  if lsmod | grep -q 'tproxy'; then
+    return 0
+  fi
+
+  if modprobe nft_tproxy 2>/dev/null; then
+    return 0
+  fi
+
+  log error "Missing TPROXY kernel modules. Install them with:"
+  log error "apk add kmod-nft-tproxy kmod-nf-tproxy"
+  return 1
+}
+
+#######################################
+# Create default UCI settings without overwriting user configuration.
+# Globals:
+#   SETTINGS_FILE SETTINGS_DIR SETTINGS_PACKAGE
+#######################################
+generate_default_settings() {
+  validate_settings_path || return 1
+  mkdir -p "${SETTINGS_DIR}"
+
+  if [ -f "${SETTINGS_FILE}" ]; then
+    log info "Keeping existing settings at ${SETTINGS_FILE}."
+    return 0
+  fi
+
+  log info "Creating default settings at ${SETTINGS_FILE}..."
+  cat <<'EOF' >"${SETTINGS_FILE}"
+config main 'main'
+	option xray_config '/etc/xray/config.json'
+	option inbound_tag 'transparent-tproxy'
+	option port '10807'
+	option mark '1'
+	option route_table '100'
+	option lan_subnet '192.168.1.0/24'
+EOF
+}
+
+#######################################
+# Validate the shared Xray JSON configuration with the Xray binary.
+# Globals:
+#   XRAY_CONFIG
+# Returns:
+#   0 for a readable valid configuration, 1 otherwise.
+#######################################
+validate_xray_config() {
+  if [ ! -r "${XRAY_CONFIG}" ]; then
+    log error "Xray configuration is not readable: ${XRAY_CONFIG}"
+    return 1
+  fi
+
+  if ! xray run -test -format json -config "${XRAY_CONFIG}" >/dev/null 2>&1; then
+    log error "Xray configuration validation failed: ${XRAY_CONFIG}"
+    return 1
+  fi
+}
+
+#######################################
+# Confirm that the native OpenWrt Xray service is enabled.
+# Returns:
+#   0 when enabled in /etc/config/xray, 1 otherwise.
+#######################################
+check_xray_service_enabled() {
+  if [ "$(uci -q get xray.enabled.enabled 2>/dev/null || true)" = 1 ]; then
+    return 0
+  fi
+
+  log error "The native Xray service is disabled in /etc/config/xray."
+  log error "Enable and configure that shared service before using TPROXY."
+  return 1
+}
+
+#######################################
+# Enable the shared native Xray instance without changing its config source.
+# Side Effects:
+#   Adds or updates only xray.enabled.enabled in /etc/config/xray.
+# Returns:
+#   0 on success, 1 if the native Xray config section is unavailable.
+#######################################
+configure_xray_service_enabled() {
+  if ! uci -q get xray.config >/dev/null 2>&1; then
+    log error "The native Xray config section is missing from /etc/config/xray."
+    return 1
+  fi
+
+  if [ "$(uci -q get xray.enabled.enabled 2>/dev/null || true)" = 1 ]; then
+    return 0
+  fi
+
+  log info "Enabling the shared Xray instance in /etc/config/xray..."
+  uci set xray.enabled=enabled
+  uci set xray.enabled.enabled='1'
+  uci commit xray
+}
+
+#######################################
+# Start the shared Xray service when it is not already running.
+# Returns:
+#   0 when Xray is ready, 1 on timeout or service failure.
+#######################################
+ensure_xray_running() {
+  local attempts=0
+
+  if /etc/init.d/xray status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log info "Starting the shared Xray service..."
+  /etc/init.d/xray start || return 1
+
+  while ! /etc/init.d/xray status >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "${attempts}" -ge 10 ]; then
+      log error "Xray did not become ready."
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+#######################################
+# Generate the rc.common wrapper used at boot and shutdown.
+# Globals:
+#   INIT_SCRIPT SETTINGS_FILE
 #######################################
 generate_init_script() {
   local self_path
   self_path="$(readlink -f "$0")"
 
   log info "Generating init script at ${INIT_SCRIPT}..."
-  cat <<EOF > "${INIT_SCRIPT}"
+  cat <<EOF >"${INIT_SCRIPT}"
 #!/bin/sh /etc/rc.common
 
 START=99
 STOP=10
 
-EXTRA_COMMANDS="setup teardown status"
-
 start() {
-  ${self_path} _start_daemon
+  ${self_path} -c ${SETTINGS_FILE} _start_daemon
 }
 
 stop() {
-  ${self_path} _stop_daemon
-}
-
-status() {
-  ${self_path} status
-}
-
-setup() {
-  ${self_path} setup
-}
-
-teardown() {
-  ${self_path} teardown
+  ${self_path} -c ${SETTINGS_FILE} _stop_daemon
 }
 EOF
   chmod +x "${INIT_SCRIPT}"
 }
 
 #######################################
-# Writes the OpenWrt hotplug hook to disk.
+# Generate the iface hook that restores rules after network events.
 # Globals:
-#   HOTPLUG_HOOK
-# Arguments:
-#   None
-# Outputs:
-#   Creates the interface hotplug hook.
-# Returns:
-#   0 on success.
+#   HOTPLUG_HOOK ACTIVE_FILE SETTINGS_FILE
 #######################################
 generate_hotplug_hook() {
   local self_path
@@ -174,61 +366,38 @@ generate_hotplug_hook() {
 
   log info "Generating hotplug hook at ${HOTPLUG_HOOK}..."
   mkdir -p /etc/hotplug.d/iface
-  cat <<EOF > "${HOTPLUG_HOOK}"
+  cat <<EOF >"${HOTPLUG_HOOK}"
 #!/bin/sh
-if [ "\$ACTION" = "ifup" ]; then
-  (
-    sleep 5
-    ${self_path} _reload_rules
-  ) &
-fi
+[ "\$ACTION" = "ifup" ] || exit 0
+[ -e "${ACTIVE_FILE}" ] || exit 0
+(
+  sleep 5
+  ${self_path} -c ${SETTINGS_FILE} _reload_rules
+) &
 EOF
+  chmod +x "${HOTPLUG_HOOK}"
 }
 
 #######################################
-# Writes the nftables TPROXY rule definitions to disk.
+# Render the nftables TPROXY chain from validated settings.
 # Globals:
-#   NFT_RULE_FILE
-#   LAN_SUBNET
-#   TPROXY_PORT
-#   TPROXY_MARK
-# Arguments:
-#   None
-# Outputs:
-#   Creates the nftables rule file.
-# Returns:
-#   0 on success.
+#   NFT_RULE_FILE LAN_SUBNET TPROXY_PORT TPROXY_MARK
 #######################################
 generate_nft_rules() {
+  local local_networks="127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8"
+  local other_networks="172.16.0.0/12, 224.0.0.0/4, 255.255.255.255/32"
+
   log info "Generating nftables rules at ${NFT_RULE_FILE}..."
   mkdir -p /etc/xray
-
-  local l_nets="127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8"
-  local o_nets="172.16.0.0/12, 224.0.0.0/4, 255.255.255.255/32"
-
-  cat <<EOF > "${NFT_RULE_FILE}"
+  cat <<EOF >"${NFT_RULE_FILE}"
 table inet fw4 {
   chain xray_tproxy {
-    # Bypass reply traffic for connections initiated from the outside
     ct direction reply return
-
-    # Bypass traffic destined to the router's own IPs fixes Hairpin NAT/loopback
     fib daddr type local return
-
-    # Only process LAN traffic
     ip saddr != ${LAN_SUBNET} return
-
-    # Bypass local network destinations
-    ip daddr { ${l_nets}, ${o_nets} } return
-
-    # Leave DNS enforcement to downstream firewall rules. TPROXY runs before
-    # dstnat, so intercepting these ports conflicts with services such as
-    # https-dns-proxy force_dns. Port 53 can then be redirected to dnsmasq,
-    # while port 853 can be rejected by the regular forwarding rules.
+    ip daddr { ${local_networks}, ${other_networks} } return
     meta l4proto { tcp, udp } th dport { 53, 853 } return
-
-    # Apply TPROXY for TCP and UDP
-    meta l4proto { tcp, udp } tproxy to :${TPROXY_PORT} \\
+    meta l4proto { tcp, udp } counter tproxy to :${TPROXY_PORT} \\
       meta mark set ${TPROXY_MARK} accept
   }
 }
@@ -236,415 +405,361 @@ EOF
 }
 
 #######################################
-# Configures UCI settings for the xray daemon.
-# Globals:
-#   XRAY_CONF_FILE
-# Arguments:
-#   None
-# Outputs:
-#   Modifies and commits UCI configuration.
+# Install settings, rules, lifecycle integration, and autostart.
 # Returns:
-#   0 on success.
-#######################################
-configure_uci() {
-  log info "Setting up UCI configuration for Xray..."
-  uci -q delete xray.enabled || true
-  uci -q delete xray.config || true
-  uci set xray.enabled=enabled
-  uci set xray.enabled.enabled='1'
-  uci set xray.config=config
-  uci set xray.config.format='json'
-  uci set xray.config.conffiles="${XRAY_CONF_FILE}"
-  uci commit xray
-}
-
-#######################################
-# Prepares configuration, rules, init script, and hooks.
-# Globals:
-#   INIT_SCRIPT
-# Arguments:
-#   None
-# Outputs:
-#   Writes files and configures the system.
-# Returns:
-#   0 on success.
+#   0 on success, 1 when a prerequisite or validation fails.
 #######################################
 cmd_setup() {
-  if [ -x "${INIT_SCRIPT}" ]; then
-    log info "Setup has already been run. Use 'teardown' to reset."
-    return 0
-  fi
+  generate_default_settings || return 1
+  load_settings || return 1
+  check_commands uci nft xray ip modprobe || return 1
+  check_tproxy_support || return 1
+  validate_xray_config || return 1
+  configure_xray_service_enabled || return 1
+  check_xray_service_enabled || return 1
 
-  configure_uci
   generate_nft_rules
   generate_init_script
   generate_hotplug_hook
 
-  log info "Enabling init service..."
+  log info "Enabling TPROXY autostart..."
   "${INIT_SCRIPT}" enable
-
-  log success "Setup complete."
-  log info "Run '$(colorize green "xray-tproxy.sh start")' to activate."
-  return 0
+  log success "Setup complete. Settings: ${SETTINGS_FILE}"
+  log info "Run 'xray-tproxy start' to activate TPROXY now."
 }
 
 #######################################
-# Re-applies the nftables chain and routing rules if missing.
+# Idempotently restore TPROXY policy routing and nftables interception.
 # Globals:
-#   NFT_RULE_FILE
-#   TPROXY_MARK
-#   ROUTE_TABLE
-# Arguments:
-#   None
-# Outputs:
-#   Modifies fw4 nftables and routing rules in memory.
+#   ACTIVE_FILE NFT_RULE_FILE TPROXY_MARK ROUTE_TABLE
 # Returns:
-#   0 on success.
+#   0 when inactive or successfully applied, 1 on rule failure.
 #######################################
 cmd_reload_rules() {
-  # If the base table doesn't exist, fw4 is not ready.
-  if ! nft list table inet fw4 >/dev/null 2>&1; then
-    return 0
-  fi
-
-  # Only reload if the service is intended to be enabled in UCI.
-  if [ "$(uci -q get xray.enabled.enabled)" != "1" ]; then
-    return 0
-  fi
-
-  # Restore policy routing if missing (flushed by network restart).
-  if ! ip rule list | grep -q "lookup ${ROUTE_TABLE}"; then
-    ip rule add fwmark "${TPROXY_MARK}" table "${ROUTE_TABLE}" \
-      2>/dev/null || true
-  fi
-
-  if ! ip route list table "${ROUTE_TABLE}" 2>/dev/null | grep -q "default"; then
-    ip route add local default dev lo table "${ROUTE_TABLE}" \
-      2>/dev/null || true
-  fi
-
-  # Re-apply the base chain definitions safely. If the chain exists, flush it
-  # first to prevent accumulating duplicate rules on successive reloads.
-  if nft list chain inet fw4 xray_tproxy >/dev/null 2>&1; then
-    nft flush chain inet fw4 xray_tproxy 2>/dev/null || true
-  fi
-
-  if [ -f "${NFT_RULE_FILE}" ]; then
-    nft -f "${NFT_RULE_FILE}" 2>/dev/null || true
-  fi
-
-  # Ensure the jump rule is present in mangle_prerouting.
-  # Use 'insert' instead of 'add' to place it at the TOP of the chain.
-  # This prevents standard fw4 rules (like mwan3 or QoS) from accepting
-  # or routing the packet before our transparent proxy logic catches it.
-  if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | \
-      grep -q 'jump xray_tproxy'; then
-    nft insert rule inet fw4 mangle_prerouting jump xray_tproxy \
-      2>/dev/null || true
-  fi
-  return 0
-}
-
-#######################################
-# Activates routing and firewall rules.
-# Called internally by the init script wrapper.
-# Globals:
-#   NFT_RULE_FILE
-# Arguments:
-#   None
-# Outputs:
-#   Applies rules to the system.
-# Returns:
-#   0 on success, 1 on error.
-#######################################
-cmd_start_daemon() {
-  log info "Applying policy routing and nftables rules..."
-  if [ ! -f "${NFT_RULE_FILE}" ]; then
-    log error "Rule file ${NFT_RULE_FILE} not found. Run 'setup' first."
+  [ -e "${ACTIVE_FILE}" ] || return 0
+  [ -f "${NFT_RULE_FILE}" ] || {
+    log error "Rule file is missing: ${NFT_RULE_FILE}"
     return 1
+  }
+
+  nft list table inet fw4 >/dev/null 2>&1 || return 0
+
+  if ! ip -4 rule list | grep -q "fwmark 0x$(printf '%x' "${TPROXY_MARK}").*lookup ${ROUTE_TABLE}"; then
+    ip -4 rule add fwmark "${TPROXY_MARK}" table "${ROUTE_TABLE}"
   fi
 
-  # cmd_reload_rules is fully idempotent and handles all state enforcement
-  cmd_reload_rules
+  if ! ip -4 route list table "${ROUTE_TABLE}" | grep -q '^local default dev lo'; then
+    ip -4 route replace local default dev lo table "${ROUTE_TABLE}"
+  fi
 
-  log info "Starting native xray daemon..."
-  /etc/init.d/xray start || true
+  if nft list chain inet fw4 xray_tproxy >/dev/null 2>&1; then
+    nft flush chain inet fw4 xray_tproxy
+  fi
+  nft -f "${NFT_RULE_FILE}"
 
-  log success "TPROXY rules activated."
-  return 0
+  if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null |
+    grep -q 'jump xray_tproxy'; then
+    nft insert rule inet fw4 mangle_prerouting jump xray_tproxy
+  fi
 }
 
 #######################################
-# Removes routing and firewall rules.
-# Called internally by the init script wrapper.
+# Remove all TPROXY runtime state owned by this script.
 # Globals:
-#   TPROXY_MARK
-#   ROUTE_TABLE
-# Arguments:
-#   None
-# Outputs:
-#   Removes rules from the system.
-# Returns:
-#   0 on success.
+#   TPROXY_MARK ROUTE_TABLE
 #######################################
-cmd_stop_daemon() {
-  log info "Stopping native xray daemon..."
-  /etc/init.d/xray stop || true
+remove_tproxy_rules() {
+  local handle
 
-  log info "Flushing active nftables TPROXY rules..."
-  local line handle
-  line=$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | \
-    grep 'jump xray_tproxy' || true)
-  if [ -n "${line}" ]; then
-    handle="${line##* }"
-    nft delete rule inet fw4 mangle_prerouting handle "${handle}" \
-      2>/dev/null || true
-  fi
+  while :; do
+    handle="$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null |
+      awk '/jump xray_tproxy/ { print $NF; exit }')"
+    [ -n "${handle}" ] || break
+    nft delete rule inet fw4 mangle_prerouting handle "${handle}" 2>/dev/null || break
+  done
+
   nft flush chain inet fw4 xray_tproxy 2>/dev/null || true
   nft delete chain inet fw4 xray_tproxy 2>/dev/null || true
 
-  log info "Removing policy routing..."
-  while ip rule del fwmark "${TPROXY_MARK}" table "${ROUTE_TABLE}" \
-    2>/dev/null; do :; done
-  ip route del local default dev lo table "${ROUTE_TABLE}" \
-    2>/dev/null || true
-
-  log success "TPROXY rules deactivated."
-  return 0
+  while ip -4 rule del fwmark "${TPROXY_MARK}" table "${ROUTE_TABLE}" 2>/dev/null; do
+    :
+  done
+  ip -4 route flush table "${ROUTE_TABLE}" 2>/dev/null || true
 }
 
 #######################################
-# Public wrapper to start the service.
-# Globals:
-#   INIT_SCRIPT
-# Arguments:
-#   None
-# Outputs:
-#   Invokes init script.
-# Returns:
-#   0 on success, 1 on error.
+# Activate interception after the shared Xray service is ready.
+# Side Effects:
+#   Creates ACTIVE_FILE and installs routing/firewall state.
 #######################################
-cmd_start() {
-  if [ ! -x "${INIT_SCRIPT}" ]; then
-    log error "Init script not found. Run 'setup' first."
+cmd_start_daemon() {
+  check_xray_service_enabled || return 1
+  validate_xray_config || return 1
+  ensure_xray_running || return 1
+
+  mkdir -p "${ACTIVE_FILE%/*}"
+  touch "${ACTIVE_FILE}"
+
+  if ! cmd_reload_rules; then
+    rm -f "${ACTIVE_FILE}"
+    remove_tproxy_rules
     return 1
   fi
+
+  log success "TPROXY routing is active."
+}
+
+#######################################
+# Deactivate interception while leaving the shared Xray service running.
+#######################################
+cmd_stop_daemon() {
+  rm -f "${ACTIVE_FILE}"
+  log info "Removing TPROXY routing and nftables rules..."
+  remove_tproxy_rules
+  log success "TPROXY routing is inactive. The shared Xray service was left running."
+}
+
+#######################################
+# Invoke the installed init wrapper to activate TPROXY.
+#######################################
+cmd_start() {
+  [ -x "${INIT_SCRIPT}" ] || {
+    log error "Init script not found. Run 'setup' first."
+    return 1
+  }
   "${INIT_SCRIPT}" start
 }
 
 #######################################
-# Public wrapper to stop the service.
-# Globals:
-#   INIT_SCRIPT
-# Arguments:
-#   None
-# Outputs:
-#   Invokes init script.
-# Returns:
-#   0 on success, 1 on error.
+# Invoke the installed init wrapper to deactivate TPROXY.
 #######################################
 cmd_stop() {
-  if [ ! -x "${INIT_SCRIPT}" ]; then
-    log error "Init script not found. Already stopped or missing."
+  [ -x "${INIT_SCRIPT}" ] || {
+    log error "Init script not found. Run 'setup' first."
     return 1
-  fi
+  }
   "${INIT_SCRIPT}" stop
 }
 
 #######################################
-# Disables service and removes all generated files and rules.
-# Globals:
-#   INIT_SCRIPT
-#   HOTPLUG_HOOK
-#   NFT_RULE_FILE
-# Arguments:
-#   None
-# Outputs:
-#   Removes files and rules.
-# Returns:
-#   0 on success.
+# Recreate TPROXY runtime routing through public lifecycle commands.
 #######################################
-cmd_teardown() {
-  log info "Stopping service and flushing rules..."
-  if [ -x "${INIT_SCRIPT}" ]; then
-    "${INIT_SCRIPT}" stop || true
-    "${INIT_SCRIPT}" disable || true
-  fi
-
-  log info "Cleaning up generated files and UCI configuration..."
-  uci -q delete xray.enabled || true
-  uci commit xray
-
-  rm -f "${NFT_RULE_FILE}"
-  rm -f "${INIT_SCRIPT}"
-  rm -f "${HOTPLUG_HOOK}"
-
-  log success "Teardown complete. System restored."
-  return 0
+cmd_restart() {
+  cmd_stop
+  cmd_start
 }
 
 #######################################
-# Checks and displays current daemon and routing status.
-# Globals:
-#   TPROXY_MARK
-#   ROUTE_TABLE
-# Arguments:
-#   None
-# Outputs:
-#   Writes status to stdout.
+# Enable TPROXY reconstruction during boot.
+#######################################
+cmd_enable() {
+  [ -x "${INIT_SCRIPT}" ] || {
+    log error "Init script not found. Run 'setup' first."
+    return 1
+  }
+  "${INIT_SCRIPT}" enable
+  log success "TPROXY autostart enabled."
+}
+
+#######################################
+# Disable boot activation without changing current runtime state.
+#######################################
+cmd_disable() {
+  [ -x "${INIT_SCRIPT}" ] || {
+    log error "Init script not found. Run 'setup' first."
+    return 1
+  }
+  "${INIT_SCRIPT}" disable
+  log success "TPROXY autostart disabled. Current runtime state was not changed."
+}
+
+#######################################
+# Remove owned runtime, init, hotplug, and nftables integration.
+# Notes:
+#   Preserves the shared Xray service and script settings file.
+#######################################
+cmd_teardown() {
+  log info "Removing TPROXY integration..."
+  if [ -x "${INIT_SCRIPT}" ]; then
+    "${INIT_SCRIPT}" stop || true
+    "${INIT_SCRIPT}" disable || true
+  else
+    rm -f "${ACTIVE_FILE}"
+    remove_tproxy_rules
+  fi
+
+  rm -f "${NFT_RULE_FILE}" "${INIT_SCRIPT}" "${HOTPLUG_HOOK}"
+  log success "TPROXY integration removed."
+  log info "The shared Xray service and ${SETTINGS_FILE} were preserved."
+}
+
+#######################################
+# Report shared Xray, policy-routing, and nftables state.
 # Returns:
-#   0 if running, 1 otherwise.
+#   0 only when every required component is active, 1 otherwise.
 #######################################
 cmd_status() {
   local all_ok=true
 
+  log info "Settings: ${SETTINGS_FILE}"
+  log info "Xray config: ${XRAY_CONFIG}"
+  log info "Expected inbound: ${INBOUND_TAG}"
+
   if /etc/init.d/xray status >/dev/null 2>&1; then
     log success "Xray service is running."
   else
-    log warn "Xray service is NOT running."
+    log warn "Xray service is not running."
     all_ok=false
   fi
 
-  if ip rule list | grep -q "lookup ${ROUTE_TABLE}"; then
-    log success "TPROXY policy routing is active."
+  if [ -e "${ACTIVE_FILE}" ]; then
+    log success "TPROXY runtime mode is active."
   else
-    log warn "TPROXY policy routing is NOT active."
+    log warn "TPROXY runtime mode is inactive."
     all_ok=false
   fi
 
-  if nft list chain inet fw4 mangle_prerouting 2>/dev/null | \
-      grep -q 'jump xray_tproxy'; then
-    log success "nftables TPROXY rules are applied."
+  if ip -4 rule list | grep -q "lookup ${ROUTE_TABLE}"; then
+    log success "Policy rule points marked traffic to table ${ROUTE_TABLE}."
   else
-    log warn "nftables TPROXY rules are NOT applied."
+    log warn "Policy rule for table ${ROUTE_TABLE} is missing."
     all_ok=false
   fi
 
-  if [ "${all_ok}" = "true" ]; then
-    log success "TPROXY is fully active and configured correctly."
+  if ip -4 route list table "${ROUTE_TABLE}" 2>/dev/null |
+    grep -q '^local default dev lo'; then
+    log success "Table ${ROUTE_TABLE} has the local default route."
+  else
+    log warn "Table ${ROUTE_TABLE} has no local default route."
+    all_ok=false
+  fi
+
+  if nft list chain inet fw4 mangle_prerouting 2>/dev/null |
+    grep -q 'jump xray_tproxy'; then
+    log success "nftables TPROXY interception is installed."
+  else
+    log warn "nftables TPROXY interception is missing."
+    all_ok=false
+  fi
+
+  if [ "${all_ok}" = true ]; then
+    log success "TPROXY is fully active."
     return 0
-  else
-    log error "TPROXY is partially or completely disabled."
-    return 1
   fi
+
+  log error "TPROXY is inactive or partially configured."
+  return 1
 }
 
 #######################################
-# Displays script version.
-# Globals:
-#   SCRIPT_VERSION
-# Arguments:
-#   None
-# Outputs:
-#   Writes version to stdout.
-# Returns:
-#   0
+# Print the script version.
 #######################################
 show_version() {
-  local name="${0##*/}"
-  name="${name%.sh}"
-  printf "%s version %s\n" "${name}" "$(colorize green "${SCRIPT_VERSION}")"
+  printf "xray-tproxy version %s\n" "$(colorize green "${SCRIPT_VERSION}")"
 }
 
 #######################################
-# Displays detailed usage information.
-# Globals:
-#   None
-# Arguments:
-#   None
-# Outputs:
-#   Writes usage help to stdout.
-# Returns:
-#   0
+# Print command and option documentation.
 #######################################
 usage() {
-  local name="${0##*/}"
-  name="${name%.sh}"
-  cat << EOF
-Usage: $(colorize yellow "${name}") $(colorize green "COMMAND")
+  cat <<EOF
+Usage: $(colorize yellow "xray-tproxy") [OPTIONS] $(colorize green "COMMAND")
 
-OpenWrt Xray TPROXY Manager.
-Tested on: OpenWrt 25.12.4
+Manage OpenWrt policy routing and nftables interception for an Xray TPROXY
+inbound. The shared Xray service is never stopped or removed.
 
-$(colorize blue "Lifecycle Commands:")
-  $(colorize green "setup")     Prepare configs, init scripts, and hooks.
-  $(colorize green "start")     Apply rules and start the proxy.
-  $(colorize green "status")    Check if proxy and routing are active.
-  $(colorize green "stop")      Stop the proxy and restore default routing.
-  $(colorize green "teardown")  Completely remove all configs and hooks.
+Commands:
+  setup       Create settings, init integration, rules, and enable autostart.
+  start       Start Xray if needed and activate TPROXY routing.
+  stop        Remove TPROXY routing without stopping Xray.
+  restart     Reapply TPROXY routing.
+  status      Show Xray, policy-routing, and nftables status.
+  enable      Enable TPROXY at boot.
+  disable     Disable TPROXY at boot without changing the current state.
+  teardown    Remove TPROXY integration while preserving Xray and settings.
 
-$(colorize blue "Global Options:")
-  -h, --help     Show this help message.
-  -v, --version  Show the script version.
+Options:
+  -c, --config FILE  Script settings file (default: ${DEFAULT_SETTINGS_FILE}).
+  -h, --help         Show this help message.
+  -v, --version      Show the script version.
 
-$(colorize blue "Environment:")
-  XRAY_TPROXY_PORT  Overrides the default port (10807).
+Environment:
+  XRAY_TPROXY_PORT   Override the configured TPROXY port for this invocation.
 EOF
 }
 
 #######################################
-# Script entry point.
-# Globals:
-#   None
+# Parse global options and dispatch one lifecycle command.
 # Arguments:
-#   $@: Command line arguments
-# Outputs:
-#   Dispatches to subcommands.
+#   $@: Command-line arguments.
 # Returns:
-#   0 on success, 1 on failure.
+#   The selected command status.
 #######################################
 main() {
-  if ! check_deps uci nft xray ip; then
-    return 1
-  fi
+  local command=""
 
-  if [ $# -eq 0 ]; then
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c | --config)
+        [ $# -ge 2 ] || {
+          log error "$1 requires a file path."
+          return 1
+        }
+        SETTINGS_FILE="$2"
+        shift 2
+        ;;
+      -h | --help | help)
+        usage
+        return 0
+        ;;
+      -v | --version | version)
+        show_version
+        return 0
+        ;;
+      -*)
+        log error "Unknown option: $1"
+        return 1
+        ;;
+      *)
+        command="$1"
+        shift
+        break
+        ;;
+    esac
+  done
+
+  [ -n "${command}" ] || {
     usage
     return 1
+  }
+  [ $# -eq 0 ] || {
+    log error "Unexpected argument: $1"
+    return 1
+  }
+
+  check_commands uci || return 1
+  if [ "${command}" != setup ]; then
+    load_settings || return 1
   fi
 
-  local cmd="$1"
-  shift
-
-  case "${cmd}" in
-    setup)
-      cmd_setup || return 1
-      ;;
-    start)
-      cmd_start || return 1
-      ;;
-    status)
-      cmd_status || return 1
-      ;;
-    stop)
-      cmd_stop || return 1
-      ;;
-    teardown)
-      cmd_teardown || return 1
-      ;;
-    _start_daemon)
-      cmd_start_daemon || return 1
-      ;;
-    _stop_daemon)
-      cmd_stop_daemon || return 1
-      ;;
-    _reload_rules)
-      cmd_reload_rules || return 1
-      ;;
-    -v|--version|version)
-      show_version
-      ;;
-    -h|--help|help)
-      usage
-      ;;
+  case "${command}" in
+    setup) cmd_setup ;;
+    start) check_commands nft xray ip && cmd_start ;;
+    stop) check_commands nft ip && cmd_stop ;;
+    restart) check_commands nft xray ip && cmd_restart ;;
+    status) check_commands nft ip && cmd_status ;;
+    enable) cmd_enable ;;
+    disable) cmd_disable ;;
+    teardown) check_commands nft ip && cmd_teardown ;;
+    _start_daemon) check_commands nft xray ip && cmd_start_daemon ;;
+    _stop_daemon) check_commands nft ip && cmd_stop_daemon ;;
+    _reload_rules) check_commands nft ip && cmd_reload_rules ;;
     *)
-      log error "Unknown command: ${cmd}"
+      log error "Unknown command: ${command}"
       usage
       return 1
       ;;
   esac
 }
 
-if ! main "$@"; then
-  exit 1
-fi
+main "$@"
