@@ -7,12 +7,14 @@
 
 set -eu
 
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.2.0"
 readonly DEFAULT_SETTINGS_FILE="/etc/config/xray-tun"
 readonly INIT_SCRIPT="/etc/init.d/xray-tun"
 readonly IFACE_HOTPLUG_HOOK="/etc/hotplug.d/iface/99-xray-tun"
 readonly NET_HOTPLUG_HOOK="/etc/hotplug.d/net/99-xray-tun"
 readonly ACTIVE_FILE="/var/run/xray-tun.active"
+readonly NFT_TABLE="xray_tun"
+readonly NFT_CHAIN="reply_bypass"
 readonly FIREWALL_ZONE_SECTION="xray_tun"
 readonly FIREWALL_FORWARDING_SECTION="lan_to_xray_tun"
 
@@ -27,6 +29,9 @@ LAN_DEVICE="br-lan"
 LAN_SUBNET="192.168.1.0/24"
 ROUTE_TABLE="101"
 RULE_PRIORITY="11000"
+REPLY_RULE_PRIORITY="10900"
+REPLY_MARK="2"
+REPLY_MARK_HEX="0x2"
 WAIT_SECONDS="20"
 BYPASS_CIDRS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4"
 
@@ -122,7 +127,8 @@ uci_get() {
 # Load runtime settings from UCI over built-in defaults.
 # Globals:
 #   XRAY_CONFIG INBOUND_TAG TUN_DEVICE LAN_DEVICE LAN_SUBNET
-#   ROUTE_TABLE RULE_PRIORITY WAIT_SECONDS BYPASS_CIDRS
+#   ROUTE_TABLE RULE_PRIORITY REPLY_RULE_PRIORITY REPLY_MARK REPLY_MARK_HEX
+#   WAIT_SECONDS BYPASS_CIDRS
 # Returns:
 #   0 when all loaded values are valid, 1 otherwise.
 #######################################
@@ -145,6 +151,10 @@ load_settings() {
   [ -z "${value}" ] || ROUTE_TABLE="${value}"
   value="$(uci_get rule_priority)"
   [ -z "${value}" ] || RULE_PRIORITY="${value}"
+  value="$(uci_get reply_rule_priority)"
+  [ -z "${value}" ] || REPLY_RULE_PRIORITY="${value}"
+  value="$(uci_get reply_mark)"
+  [ -z "${value}" ] || REPLY_MARK="${value}"
   value="$(uci_get wait_seconds)"
   [ -z "${value}" ] || WAIT_SECONDS="${value}"
   value="$(uci_get bypass_cidr)"
@@ -197,7 +207,7 @@ validate_device_name() {
 # Validate every loaded routing setting before use as root.
 # Globals:
 #   TUN_DEVICE LAN_DEVICE LAN_SUBNET ROUTE_TABLE RULE_PRIORITY
-#   WAIT_SECONDS BYPASS_CIDRS
+#   REPLY_RULE_PRIORITY REPLY_MARK REPLY_MARK_HEX WAIT_SECONDS BYPASS_CIDRS
 # Returns:
 #   0 when all settings are safe and well-formed, 1 otherwise.
 #######################################
@@ -206,9 +216,23 @@ validate_settings() {
 
   validate_number "route_table" "${ROUTE_TABLE}" || return 1
   validate_number "rule_priority" "${RULE_PRIORITY}" || return 1
+  validate_number "reply_rule_priority" "${REPLY_RULE_PRIORITY}" || return 1
+  validate_number "reply_mark" "${REPLY_MARK}" || return 1
   validate_number "wait_seconds" "${WAIT_SECONDS}" || return 1
   validate_device_name "device" "${TUN_DEVICE}" || return 1
   validate_device_name "lan_device" "${LAN_DEVICE}" || return 1
+
+  if [ "${REPLY_RULE_PRIORITY}" -ge "${RULE_PRIORITY}" ]; then
+    log error "reply_rule_priority must be lower than rule_priority"
+    return 1
+  fi
+
+  if [ "${REPLY_MARK}" -le 0 ] ||
+    [ $((REPLY_MARK & (REPLY_MARK - 1))) -ne 0 ]; then
+    log error "reply_mark must be a non-zero power of two: ${REPLY_MARK}"
+    return 1
+  fi
+  REPLY_MARK_HEX="$(printf '0x%x' "${REPLY_MARK}")"
 
   case "${LAN_SUBNET}" in
     '' | *[!0-9./]*)
@@ -300,6 +324,8 @@ config main 'main'
 	option lan_subnet '192.168.1.0/24'
 	option route_table '101'
 	option rule_priority '11000'
+	option reply_rule_priority '10900'
+	option reply_mark '2'
 	option wait_seconds '20'
 
 	list bypass_cidr '10.0.0.0/8'
@@ -532,7 +558,7 @@ remove_firewall() {
 cmd_setup() {
   generate_default_settings || return 1
   load_settings || return 1
-  check_commands uci xray ip modprobe || return 1
+  check_commands uci xray ip nft modprobe || return 1
   check_tun_support || return 1
   validate_xray_config || return 1
   configure_xray_service_enabled || return 1
@@ -549,6 +575,47 @@ cmd_setup() {
 }
 
 #######################################
+# Install the prerouting rule that marks reply-direction LAN packets.
+# Globals:
+#   NFT_TABLE NFT_CHAIN LAN_DEVICE LAN_SUBNET REPLY_MARK_HEX
+# Notes:
+#   Bitwise OR preserves packet-mark bits owned by other applications.
+#######################################
+install_reply_bypass_nft() {
+  nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
+  nft -f - <<EOF
+table inet ${NFT_TABLE} {
+  chain ${NFT_CHAIN} {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "${LAN_DEVICE}" ip saddr ${LAN_SUBNET} ct direction reply \
+      meta mark set meta mark | ${REPLY_MARK_HEX}
+  }
+}
+EOF
+}
+
+#######################################
+# Remove the reply-direction packet-marking table owned by this script.
+# Globals:
+#   NFT_TABLE
+#######################################
+remove_reply_bypass_nft() {
+  nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
+}
+
+#######################################
+# Delete this script's exact reply-bypass policy rule, including duplicates.
+# Globals:
+#   REPLY_RULE_PRIORITY REPLY_MARK_HEX
+#######################################
+remove_reply_policy_rule() {
+  while ip -4 rule del priority "${REPLY_RULE_PRIORITY}" \
+    fwmark "${REPLY_MARK_HEX}/${REPLY_MARK_HEX}" table main 2>/dev/null; do
+    :
+  done
+}
+
+#######################################
 # Delete this script's exact LAN policy rule, including duplicates.
 # Globals:
 #   RULE_PRIORITY LAN_DEVICE LAN_SUBNET ROUTE_TABLE
@@ -561,10 +628,10 @@ remove_policy_rule() {
 }
 
 #######################################
-# Rebuild table 101-style routes and the LAN ingress policy rule.
+# Rebuild reply bypass, table 101-style routes, and LAN policy rules.
 # Globals:
 #   ACTIVE_FILE TUN_DEVICE BYPASS_CIDRS ROUTE_TABLE RULE_PRIORITY
-#   LAN_DEVICE LAN_SUBNET
+#   REPLY_RULE_PRIORITY REPLY_MARK_HEX LAN_DEVICE LAN_SUBNET
 # Returns:
 #   0 when inactive or successfully applied, 1 when the TUN device is absent.
 #######################################
@@ -574,13 +641,17 @@ cmd_reload_routes() {
   [ -e "${ACTIVE_FILE}" ] || return 0
   ip link show dev "${TUN_DEVICE}" >/dev/null 2>&1 || return 1
 
+  remove_reply_policy_rule
   remove_policy_rule
   ip -4 route flush table "${ROUTE_TABLE}" 2>/dev/null || true
+  install_reply_bypass_nft
 
   for cidr in ${BYPASS_CIDRS}; do
     ip -4 route add throw "${cidr}" table "${ROUTE_TABLE}"
   done
   ip -4 route add default dev "${TUN_DEVICE}" table "${ROUTE_TABLE}"
+  ip -4 rule add priority "${REPLY_RULE_PRIORITY}" \
+    fwmark "${REPLY_MARK_HEX}/${REPLY_MARK_HEX}" lookup main
   ip -4 rule add priority "${RULE_PRIORITY}" iif "${LAN_DEVICE}" \
     from "${LAN_SUBNET}" lookup "${ROUTE_TABLE}"
 }
@@ -591,8 +662,10 @@ cmd_reload_routes() {
 #   ROUTE_TABLE
 #######################################
 remove_tun_routes() {
+  remove_reply_policy_rule
   remove_policy_rule
   ip -4 route flush table "${ROUTE_TABLE}" 2>/dev/null || true
+  remove_reply_bypass_nft
 }
 
 #######################################
@@ -752,6 +825,22 @@ cmd_status() {
     all_ok=false
   fi
 
+  if ip -4 rule list |
+    grep -q "${REPLY_RULE_PRIORITY}:.*fwmark ${REPLY_MARK_HEX}/${REPLY_MARK_HEX}.*lookup main"; then
+    log success "Reply-direction packets bypass TUN through the main table."
+  else
+    log warn "Reply-bypass policy rule is missing."
+    all_ok=false
+  fi
+
+  if nft list chain inet "${NFT_TABLE}" "${NFT_CHAIN}" 2>/dev/null |
+    grep -q 'ct direction reply'; then
+    log success "Conntrack reply marking is active."
+  else
+    log warn "Conntrack reply marking is missing."
+    all_ok=false
+  fi
+
   if ip -4 route list table "${ROUTE_TABLE}" 2>/dev/null |
     grep -q "^default dev ${TUN_DEVICE}"; then
     log success "Table ${ROUTE_TABLE} routes Internet traffic to ${TUN_DEVICE}."
@@ -867,16 +956,16 @@ main() {
 
   case "${command}" in
     setup) cmd_setup ;;
-    start) check_commands xray ip modprobe && cmd_start ;;
-    stop) check_commands ip && cmd_stop ;;
-    restart) check_commands xray ip modprobe && cmd_restart ;;
-    status) check_commands ip && cmd_status ;;
+    start) check_commands xray ip nft modprobe && cmd_start ;;
+    stop) check_commands ip nft && cmd_stop ;;
+    restart) check_commands xray ip nft modprobe && cmd_restart ;;
+    status) check_commands ip nft && cmd_status ;;
     enable) cmd_enable ;;
     disable) cmd_disable ;;
-    teardown) check_commands ip && cmd_teardown ;;
-    _start_daemon) check_commands xray ip modprobe && cmd_start_daemon ;;
-    _stop_daemon) check_commands ip && cmd_stop_daemon ;;
-    _reload_routes) check_commands ip && cmd_reload_routes ;;
+    teardown) check_commands ip nft && cmd_teardown ;;
+    _start_daemon) check_commands xray ip nft modprobe && cmd_start_daemon ;;
+    _stop_daemon) check_commands ip nft && cmd_stop_daemon ;;
+    _reload_routes) check_commands ip nft && cmd_reload_routes ;;
     *)
       log error "Unknown command: ${command}"
       usage

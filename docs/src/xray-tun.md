@@ -67,6 +67,11 @@ The policy rule applies only to packets received from `br-lan`. Connections
 created locally by Xray therefore keep using the normal WAN route and do not
 loop back into the TUN interface.
 
+Packets in the reply direction of an existing conntrack flow are marked before
+the TUN policy rule and sent through the normal `main` table. This preserves
+the return path for WAN port forwards while newly initiated LAN connections
+still enter `xray0`.
+
 Private, link-local, and multicast destinations are represented by `throw`
 routes in table 101. They continue to the normal OpenWrt routing tables.
 
@@ -180,6 +185,8 @@ config main 'main'
         option lan_subnet '192.168.1.0/24'
         option route_table '101'
         option rule_priority '11000'
+        option reply_rule_priority '10900'
+        option reply_mark '2'
         option wait_seconds '20'
 
         list bypass_cidr '10.0.0.0/8'
@@ -197,6 +204,31 @@ xray-tun -c /etc/config/xray-tun-home start
 ```
 
 The generated init service and hotplug hooks retain the selected path.
+
+`reply_mark` is a single packet-mark bit used to recognize conntrack reply
+traffic. The script preserves all other mark bits and matches this bit with a
+mask, allowing common `mwan3` and `pbr` mark ranges to coexist. Change the
+value to another power of two if local policy-routing software already owns
+bit `0x2`. `reply_rule_priority` must be numerically lower than
+`rule_priority` so the reply bypass is evaluated first.
+
+## Port forwards
+
+TUN policy routing must not capture replies from services reached through a
+WAN port forward. The manager installs the following logical path:
+
+```text
+New LAN connection
+  → unmarked → table 101 → xray0
+
+Reply to an existing WAN connection
+  → conntrack reply → mark bit 0x2 → main table → WAN
+```
+
+This distinction also permits a LAN Xray server to use the router as an
+upstream transparent proxy: replies on its public listener return directly to
+the remote client, while separate outbound connections created by that server
+are new flows and continue through the router's TUN inbound.
 
 ## Reboot and recovery
 
